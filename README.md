@@ -10,6 +10,16 @@
 - `fixtures/`：离线验收使用的验证协议与结构化测量；
 - `tests/`：领域规则、事务、权限、HTTP API 和命令行验收测试。
 
+## 调度周期裁决契约
+
+同一调度周期内，左右机械臂控制器对实时总线的并发申请按以下规则裁决：
+
+- `GET /routes/{id}/snapshot?service_date=YYYY-MM-DD` 读取容量快照（申请集合、降级窗口、总线版本）及其版本 `snapshot_sha256`；
+- `POST /routes/{id}/allocate` 携带 `service_date` 与可选的 `expected_snapshot` 申请裁决，整个读取-裁决-提交在单个事务内完成；
+- 一个周期只产生一份有效决定，申请集合、降级窗口和总线版本随决定冻结在 `allocation_runs` 中，并写入一条 `allocation.completed` 审计事件（`GET /audit/events` 可查）；
+- 内容相同的并发申请或重试拿回首次裁决（`replayed: true`，同一个 `allocation_id`）；依据已经变化的申请收到 409 冲突，响应 `error.details` 中包含当前版本；
+- 裁决结果逐项给出 `outcome`（allocated/partial/rejected）与落选原因 `reason`，提交失败不会留下单侧动作或半更新申请，接口不泄露存储异常。
+
 ## 环境
 
 - Linux

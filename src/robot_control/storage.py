@@ -128,11 +128,14 @@ CREATE TABLE IF NOT EXISTS allocation_runs (
     route_id TEXT NOT NULL REFERENCES routes(route_id),
     service_date TEXT NOT NULL,
     input_sha256 TEXT NOT NULL,
+    route_revision INTEGER NOT NULL DEFAULT 1,
     available_capacity TEXT NOT NULL,
+    request_set_json TEXT NOT NULL DEFAULT '[]',
+    outage_window_json TEXT NOT NULL DEFAULT '[]',
     result_json TEXT NOT NULL,
     created_by TEXT NOT NULL REFERENCES supply_users(user_id),
     created_at TEXT NOT NULL,
-    UNIQUE(route_id, service_date, input_sha256)
+    UNIQUE(route_id, service_date)
 );
 
 CREATE TABLE IF NOT EXISTS transfers (
@@ -198,7 +201,7 @@ ON supply_audit_events(entity_type, entity_id, event_id);
 
 
 def connect(path: str | Path) -> sqlite3.Connection:
-    connection = sqlite3.connect(str(path), isolation_level=None, timeout=10)
+    connection = sqlite3.connect(str(path), isolation_level=None, timeout=10, check_same_thread=False)
     connection.row_factory = sqlite3.Row
     connection.execute("PRAGMA foreign_keys=ON")
     connection.execute("PRAGMA journal_mode=WAL")
@@ -209,6 +212,51 @@ def connect(path: str | Path) -> sqlite3.Connection:
 
 def initialize(connection: sqlite3.Connection) -> None:
     connection.executescript(SCHEMA)
+    _upgrade_allocation_runs(connection)
+
+
+def _upgrade_allocation_runs(connection: sqlite3.Connection) -> None:
+    """把旧版 allocation_runs（按快照去重）重建为按调度周期唯一的新结构。
+
+    旧库同一调度周期可能残留多份决定，确定性地保留每周期最早的一份。
+    """
+
+    columns = {row["name"] for row in connection.execute("PRAGMA table_info(allocation_runs)")}
+    if not columns or "route_revision" in columns:
+        return
+    connection.execute("PRAGMA foreign_keys=OFF")
+    try:
+        with transaction(connection, immediate=True):
+            # 与 SCHEMA 中 allocation_runs 的定义保持一致
+            connection.execute(
+                "CREATE TABLE allocation_runs_next ("
+                "allocation_id INTEGER PRIMARY KEY AUTOINCREMENT,"
+                "route_id TEXT NOT NULL REFERENCES routes(route_id),"
+                "service_date TEXT NOT NULL,"
+                "input_sha256 TEXT NOT NULL,"
+                "route_revision INTEGER NOT NULL DEFAULT 1,"
+                "available_capacity TEXT NOT NULL,"
+                "request_set_json TEXT NOT NULL DEFAULT '[]',"
+                "outage_window_json TEXT NOT NULL DEFAULT '[]',"
+                "result_json TEXT NOT NULL,"
+                "created_by TEXT NOT NULL REFERENCES supply_users(user_id),"
+                "created_at TEXT NOT NULL,"
+                "UNIQUE(route_id, service_date))"
+            )
+            connection.execute(
+                "INSERT INTO allocation_runs_next(allocation_id,route_id,service_date,input_sha256,"
+                "route_revision,available_capacity,request_set_json,outage_window_json,result_json,"
+                "created_by,created_at) "
+                "SELECT allocation_id,route_id,service_date,input_sha256,"
+                "COALESCE((SELECT revision FROM routes WHERE routes.route_id=legacy.route_id),1),"
+                "available_capacity,'[]','[]',result_json,created_by,created_at "
+                "FROM (SELECT *,ROW_NUMBER() OVER (PARTITION BY route_id,service_date ORDER BY allocation_id) rn "
+                "FROM allocation_runs) legacy WHERE rn=1"
+            )
+            connection.execute("DROP TABLE allocation_runs")
+            connection.execute("ALTER TABLE allocation_runs_next RENAME TO allocation_runs")
+    finally:
+        connection.execute("PRAGMA foreign_keys=ON")
 
 
 @contextmanager

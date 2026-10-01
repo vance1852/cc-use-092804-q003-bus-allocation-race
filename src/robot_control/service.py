@@ -2,16 +2,27 @@
 
 from __future__ import annotations
 
+import functools
 import hashlib
 import json
 import sqlite3
+import threading
 from datetime import timedelta
 from decimal import Decimal
-from typing import Any, Iterable, Mapping
+from typing import Any, Callable, Iterable, Mapping
 
 from .clock import SystemClock, parse_utc, utc_text
 from .errors import Conflict, Forbidden, InvalidState, NotFound, ValidationFailed
-from .models import IndexQuote, Facility, InventoryLot, NominationRequest, Route, SupplyScenario
+from .models import (
+    IndexQuote,
+    Facility,
+    InventoryLot,
+    NominationRequest,
+    Route,
+    SupplyScenario,
+    date_text,
+    required_text,
+)
 from .planning import (
     AllocationRequest,
     PricePoint,
@@ -30,6 +41,17 @@ from .planning import (
 from .storage import initialize, transaction
 
 
+def _serialized(operation: Callable) -> Callable:
+    """串行化服务方法：共享连接上的并发请求按到达顺序逐个执行。"""
+
+    @functools.wraps(operation)
+    def wrapper(self: "SupplyService", *args: Any, **kwargs: Any) -> Any:
+        with self._lock:
+            return operation(self, *args, **kwargs)
+
+    return wrapper
+
+
 ROLE_PERMISSIONS = {
     "planner": {"quote.write", "catalog.write", "scenario.write", "scenario.run"},
     "dispatcher": {"nomination.write", "allocation.run", "transfer.write", "inventory.write"},
@@ -40,6 +62,7 @@ ROLE_PERMISSIONS = {
 
 class SupplyService:
     def __init__(self, connection: sqlite3.Connection, clock=None) -> None:
+        self._lock = threading.RLock()
         self.connection = connection
         self.clock = clock or SystemClock()
         initialize(connection)
@@ -100,6 +123,7 @@ class SupplyService:
             ),
         )
 
+    @_serialized
     def create_user(self, user_id: str, display_name: str, role: str) -> dict[str, Any]:
         if role not in ROLE_PERMISSIONS:
             raise ValidationFailed("未知角色")
@@ -115,6 +139,7 @@ class SupplyService:
             raise Conflict("用户已经存在") from exc
         return {"user_id": user_id.strip(), "role": role}
 
+    @_serialized
     def record_quote(self, actor_id: str, raw: Mapping[str, Any]) -> dict[str, Any]:
         self._require(actor_id, "quote.write")
         quote = IndexQuote.from_dict(raw)
@@ -153,6 +178,7 @@ class SupplyService:
             raise Conflict("控制算力单价版本冲突") from exc
         return {"quote_id": quote_id, "market_index": quote.market_index, "trade_date": quote.trade_date}
 
+    @_serialized
     def price_summary(self, market_index: str, sessions: int = 20) -> dict[str, Any]:
         rows = self.connection.execute(
             "SELECT q.trade_date,q.close_cny FROM market_index_quotes q "
@@ -175,6 +201,7 @@ class SupplyService:
             "observations": len(points),
         }
 
+    @_serialized
     def create_facility(self, actor_id: str, raw: Mapping[str, Any]) -> dict[str, Any]:
         self._require(actor_id, "catalog.write")
         facility = Facility.from_dict(raw)
@@ -197,6 +224,7 @@ class SupplyService:
             raise Conflict("设施编号已经存在") from exc
         return dict(raw)
 
+    @_serialized
     def create_route(self, actor_id: str, raw: Mapping[str, Any]) -> dict[str, Any]:
         self._require(actor_id, "catalog.write")
         route = Route.from_dict(raw)
@@ -221,12 +249,14 @@ class SupplyService:
             raise Conflict("实时控制总线编号冲突或设施不存在") from exc
         return self.route(route.route_id)
 
+    @_serialized
     def route(self, route_id: str) -> dict[str, Any]:
         row = self.connection.execute("SELECT * FROM routes WHERE route_id=?", (route_id,)).fetchone()
         if row is None:
             raise NotFound("实时控制总线不存在")
         return dict(row)
 
+    @_serialized
     def announce_outage(
         self,
         actor_id: str,
@@ -258,6 +288,7 @@ class SupplyService:
             self._audit("route", route_id, "outage.announced", actor_id, {"outage_id": outage_id})
         return {"outage_id": outage_id, "route_id": route_id, "state": "announced"}
 
+    @_serialized
     def add_inventory_lot(self, actor_id: str, raw: Mapping[str, Any]) -> dict[str, Any]:
         self._require(actor_id, "inventory.write")
         lot = InventoryLot.from_dict(raw)
@@ -284,12 +315,14 @@ class SupplyService:
             raise Conflict("国产控制器资源批次冲突或设施不存在") from exc
         return self.inventory_lot(lot.lot_id)
 
+    @_serialized
     def inventory_lot(self, lot_id: str) -> dict[str, Any]:
         row = self.connection.execute("SELECT * FROM inventory_lots WHERE lot_id=?", (lot_id,)).fetchone()
         if row is None:
             raise NotFound("国产控制器资源批次不存在")
         return dict(row)
 
+    @_serialized
     def inventory_summary(self, facility_id: str, product: str) -> dict[str, Any]:
         rows = self.connection.execute(
             "SELECT * FROM inventory_lots WHERE facility_id=? AND product=? ORDER BY received_at,lot_id",
@@ -297,6 +330,7 @@ class SupplyService:
         ).fetchall()
         return {"facility_id": facility_id, "product": product, **weighted_inventory_cost(rows)}
 
+    @_serialized
     def submit_nomination(self, actor_id: str, raw: Mapping[str, Any]) -> dict[str, Any]:
         self._require(actor_id, "nomination.write")
         nomination = NominationRequest.from_dict(raw)
@@ -345,65 +379,203 @@ class SupplyService:
             raise Conflict("提名编号或幂等键冲突") from exc
         return response
 
-    def _capacity_for_date(self, route: sqlite3.Row, service_date: str) -> Decimal:
+    def _allocation_snapshot(self, route: sqlite3.Row, service_date: str) -> dict[str, Any]:
+        """汇总调度周期的容量快照：申请集合、降级窗口、总线版本和有效容量。
+
+        快照指纹只覆盖申请内容（不随裁决改变的字段），因此裁决提交后
+        同一周期的快照版本保持稳定，内容相同的重试可以据此识别。
+        """
+
         start = service_date + "T00:00:00Z"
         end = service_date + "T23:59:59Z"
-        rows = self.connection.execute(
-            "SELECT capacity_percent FROM route_outages WHERE route_id=? AND state IN ('announced','active') "
+        outage_rows = self.connection.execute(
+            "SELECT outage_id,starts_at,ends_at,capacity_percent,reason FROM route_outages "
+            "WHERE route_id=? AND state IN ('announced','active') "
             "AND starts_at<=? AND (ends_at IS NULL OR ends_at>=?) ORDER BY outage_id",
             (route["route_id"], end, start),
         ).fetchall()
-        percentages = [Decimal(row["capacity_percent"]) for row in rows]
-        return effective_capacity(Decimal(route["daily_capacity"]), percentages)
+        outage_window = [
+            {
+                "outage_id": row["outage_id"],
+                "starts_at": row["starts_at"],
+                "ends_at": row["ends_at"],
+                "capacity_percent": row["capacity_percent"],
+                "reason": row["reason"],
+            }
+            for row in outage_rows
+        ]
+        nomination_rows = self.connection.execute(
+            "SELECT nomination_id,requested_control_slots,priority,submitted_at FROM nominations "
+            "WHERE route_id=? AND service_date=? ORDER BY priority,submitted_at,nomination_id",
+            (route["route_id"], service_date),
+        ).fetchall()
+        request_set = [
+            {
+                "nomination_id": row["nomination_id"],
+                "requested_control_slots": row["requested_control_slots"],
+                "priority": row["priority"],
+                "submitted_at": row["submitted_at"],
+            }
+            for row in nomination_rows
+        ]
+        available = effective_capacity(
+            Decimal(route["daily_capacity"]),
+            [Decimal(row["capacity_percent"]) for row in outage_rows],
+        )
+        snapshot: dict[str, Any] = {
+            "route_id": route["route_id"],
+            "service_date": service_date,
+            "route_revision": route["revision"],
+            "available_capacity": decimal_text(available),
+            "outage_window": outage_window,
+            "request_set": request_set,
+        }
+        snapshot["snapshot_sha256"] = digest(snapshot)
+        return snapshot
 
-    def allocate(self, actor_id: str, route_id: str, service_date: str) -> dict[str, Any]:
-        self._require(actor_id, "allocation.run")
+    @_serialized
+    def capacity_snapshot(self, route_id: str, service_date: str) -> dict[str, Any]:
+        """读取调度周期当前的容量快照和快照版本，供控制器作为裁决依据。"""
+
+        service_date = date_text(service_date, "service_date")
         route = self.connection.execute("SELECT * FROM routes WHERE route_id=?", (route_id,)).fetchone()
         if route is None:
             raise NotFound("实时控制总线不存在")
-        nominations = self.connection.execute(
-            "SELECT * FROM nominations WHERE route_id=? AND service_date=? AND state='submitted' "
-            "ORDER BY priority,submitted_at,nomination_id",
-            (route_id, service_date),
-        ).fetchall()
-        if not nominations:
-            raise InvalidState("没有待分配提名")
-        requests = [
-            AllocationRequest(
-                row["nomination_id"],
-                Decimal(row["requested_control_slots"]),
-                int(row["priority"]),
-                row["submitted_at"],
-            )
-            for row in nominations
-        ]
-        available = self._capacity_for_date(route, service_date)
-        input_value = [dict(row) for row in nominations]
-        input_sha256 = digest({"route": dict(route), "nominations": input_value, "capacity": str(available)})
-        result_rows = allocate_capacity(available, requests)
-        result = {
-            "route_id": route_id,
-            "service_date": service_date,
-            "available_capacity": decimal_text(available),
-            "allocations": result_rows,
-        }
-        with transaction(self.connection, immediate=True):
-            cursor = self.connection.execute(
-                "INSERT INTO allocation_runs(route_id,service_date,input_sha256,available_capacity,result_json,"
-                "created_by,created_at) VALUES(?,?,?,?,?,?,?)",
-                (route_id, service_date, input_sha256, decimal_text(available), canonical_json(result), actor_id, self._now()),
-            )
-            for item in result_rows:
-                state = "allocated" if Decimal(item["allocated_control_slots"]) > 0 else "cancelled"
-                self.connection.execute(
-                    "UPDATE nominations SET allocated_control_slots=?,state=?,revision=revision+1 "
-                    "WHERE nomination_id=? AND state='submitted'",
-                    (item["allocated_control_slots"], state, item["nomination_id"]),
-                )
-            allocation_id = int(cursor.lastrowid)
-            self._audit("route", route_id, "allocation.completed", actor_id, {"allocation_id": allocation_id})
-        return {"allocation_id": allocation_id, **result}
+        return self._allocation_snapshot(route, service_date)
 
+    @staticmethod
+    def _allocation_response(row: sqlite3.Row, *, replayed: bool) -> dict[str, Any]:
+        return {"allocation_id": row["allocation_id"], **json.loads(row["result_json"]), "replayed": replayed}
+
+    @_serialized
+    def allocate(
+        self,
+        actor_id: str,
+        route_id: str,
+        service_date: str,
+        expected_snapshot: str | None = None,
+    ) -> dict[str, Any]:
+        """裁决一个调度周期的时隙分配。
+
+        整个读取-裁决-提交在单个 IMMEDIATE 事务内完成：同一周期只存在一份
+        有效决定，申请集合、降级窗口和总线版本随决定一起冻结。携带相同
+        快照版本的并发申请拿回首次裁决（replayed=True）；依据已经变化的
+        申请收到包含当前版本的冲突响应。
+        """
+
+        self._require(actor_id, "allocation.run")
+        service_date = date_text(service_date, "service_date")
+        if expected_snapshot is not None and not isinstance(expected_snapshot, str):
+            raise ValidationFailed("expected_snapshot 必须是快照版本字符串")
+        try:
+            with transaction(self.connection, immediate=True):
+                route = self.connection.execute(
+                    "SELECT * FROM routes WHERE route_id=?", (route_id,)
+                ).fetchone()
+                if route is None:
+                    raise NotFound("实时控制总线不存在")
+                snapshot = self._allocation_snapshot(route, service_date)
+                existing = self.connection.execute(
+                    "SELECT * FROM allocation_runs WHERE route_id=? AND service_date=?",
+                    (route_id, service_date),
+                ).fetchone()
+                if existing is not None:
+                    if expected_snapshot == existing["input_sha256"]:
+                        return self._allocation_response(existing, replayed=True)
+                    if expected_snapshot is None and snapshot["snapshot_sha256"] == existing["input_sha256"]:
+                        return self._allocation_response(existing, replayed=True)
+                    details: dict[str, Any] = {
+                        "route_id": route_id,
+                        "service_date": service_date,
+                        "snapshot_sha256": existing["input_sha256"],
+                        "allocation_id": existing["allocation_id"],
+                    }
+                    if snapshot["snapshot_sha256"] != existing["input_sha256"]:
+                        details["live_snapshot_sha256"] = snapshot["snapshot_sha256"]
+                    raise Conflict(
+                        "本调度周期已完成裁决，申请集合、降级窗口与总线版本已冻结",
+                        details=details,
+                    )
+                if expected_snapshot is not None and expected_snapshot != snapshot["snapshot_sha256"]:
+                    raise Conflict(
+                        "容量快照已变化，请基于当前版本重新申请",
+                        details={
+                            "route_id": route_id,
+                            "service_date": service_date,
+                            "snapshot_sha256": snapshot["snapshot_sha256"],
+                        },
+                    )
+                submitted = self.connection.execute(
+                    "SELECT * FROM nominations WHERE route_id=? AND service_date=? AND state='submitted' "
+                    "ORDER BY priority,submitted_at,nomination_id",
+                    (route_id, service_date),
+                ).fetchall()
+                if not submitted:
+                    raise InvalidState("没有待分配提名")
+                requests = [
+                    AllocationRequest(
+                        row["nomination_id"],
+                        Decimal(row["requested_control_slots"]),
+                        int(row["priority"]),
+                        row["submitted_at"],
+                    )
+                    for row in submitted
+                ]
+                allocations = allocate_capacity(Decimal(snapshot["available_capacity"]), requests)
+                result = {
+                    "route_id": route_id,
+                    "service_date": service_date,
+                    "snapshot_sha256": snapshot["snapshot_sha256"],
+                    "route_revision": snapshot["route_revision"],
+                    "available_capacity": snapshot["available_capacity"],
+                    "outage_window": snapshot["outage_window"],
+                    "allocations": allocations,
+                }
+                cursor = self.connection.execute(
+                    "INSERT INTO allocation_runs(route_id,service_date,input_sha256,route_revision,"
+                    "available_capacity,request_set_json,outage_window_json,result_json,created_by,created_at) "
+                    "VALUES(?,?,?,?,?,?,?,?,?,?)",
+                    (
+                        route_id,
+                        service_date,
+                        snapshot["snapshot_sha256"],
+                        snapshot["route_revision"],
+                        snapshot["available_capacity"],
+                        canonical_json(snapshot["request_set"]),
+                        canonical_json(snapshot["outage_window"]),
+                        canonical_json(result),
+                        actor_id,
+                        self._now(),
+                    ),
+                )
+                allocation_id = int(cursor.lastrowid)
+                for item in allocations:
+                    state = "allocated" if Decimal(item["allocated_control_slots"]) > 0 else "cancelled"
+                    updated = self.connection.execute(
+                        "UPDATE nominations SET allocated_control_slots=?,state=?,revision=revision+1 "
+                        "WHERE nomination_id=? AND state='submitted'",
+                        (item["allocated_control_slots"], state, item["nomination_id"]),
+                    )
+                    if updated.rowcount != 1:
+                        raise InvalidState("提名在裁决期间被改动，裁决已整体回滚")
+                self._audit(
+                    "route",
+                    route_id,
+                    "allocation.completed",
+                    actor_id,
+                    {
+                        "allocation_id": allocation_id,
+                        "service_date": service_date,
+                        "snapshot_sha256": snapshot["snapshot_sha256"],
+                    },
+                )
+                return {"allocation_id": allocation_id, **result, "replayed": False}
+        except sqlite3.IntegrityError as exc:
+            raise Conflict("裁决提交未成功，本调度周期可能已被占用，请基于当前容量快照重试") from exc
+        except sqlite3.OperationalError as exc:
+            raise Conflict("实时控制总线正在被其他控制器裁决，请稍后重试") from exc
+
+    @_serialized
     def dispatch_transfer(
         self,
         actor_id: str,
@@ -465,6 +637,7 @@ class SupplyService:
             "expected_arrival": utc_text(parse_utc(departed_at) + timedelta(hours=int(nomination["transit_hours"]))),
         }
 
+    @_serialized
     def create_scenario(self, actor_id: str, raw: Mapping[str, Any]) -> dict[str, Any]:
         self._require(actor_id, "scenario.write")
         scenario = SupplyScenario.from_dict(raw)
@@ -482,6 +655,7 @@ class SupplyService:
             raise Conflict("情景编号或内容已经存在") from exc
         return {"scenario_id": scenario.scenario_id, "state": "draft", "sha256": content_sha256}
 
+    @_serialized
     def approve_scenario(self, actor_id: str, scenario_id: str, expected_revision: int) -> dict[str, Any]:
         self._require(actor_id, "scenario.approve")
         with transaction(self.connection, immediate=True):
@@ -495,6 +669,7 @@ class SupplyService:
             self._audit("scenario", scenario_id, "scenario.approved", actor_id, {})
         return {"scenario_id": scenario_id, "state": "approved", "revision": expected_revision + 1}
 
+    @_serialized
     def run_scenario(self, actor_id: str, scenario_id: str, as_of_date: str) -> dict[str, Any]:
         self._require(actor_id, "scenario.run")
         row = self.connection.execute(
@@ -548,6 +723,7 @@ class SupplyService:
             self._audit("scenario", scenario_id, "scenario.executed", actor_id, {"run_id": run_id})
         return {"run_id": run_id, **result, "replayed": False}
 
+    @_serialized
     def audit_chain(self, actor_id: str) -> dict[str, Any]:
         self._require(actor_id, "audit.read")
         rows = self.connection.execute("SELECT * FROM supply_audit_events ORDER BY event_id").fetchall()
@@ -569,3 +745,29 @@ class SupplyService:
                 break
             previous_hash = row["event_hash"]
         return {"valid": valid, "events": len(rows), "head_hash": previous_hash}
+
+    @_serialized
+    def audit_events(self, actor_id: str, entity_type: str, entity_id: str) -> dict[str, Any]:
+        """按实体读取审计事件，供联调人员核对执行侧收到的有效决定。"""
+
+        self._require(actor_id, "audit.read")
+        entity_type = required_text(entity_type, "entity_type", 64)
+        entity_id = required_text(entity_id, "entity_id", 64)
+        rows = self.connection.execute(
+            "SELECT event_type,actor_id,payload_json,created_at FROM supply_audit_events "
+            "WHERE entity_type=? AND entity_id=? ORDER BY event_id",
+            (entity_type, entity_id),
+        ).fetchall()
+        return {
+            "entity_type": entity_type,
+            "entity_id": entity_id,
+            "events": [
+                {
+                    "event_type": row["event_type"],
+                    "actor_id": row["actor_id"],
+                    "payload": json.loads(row["payload_json"]),
+                    "created_at": row["created_at"],
+                }
+                for row in rows
+            ],
+        }

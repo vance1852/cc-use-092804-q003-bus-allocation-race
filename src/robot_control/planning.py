@@ -134,11 +134,20 @@ def allocate_capacity(
         allocated = min(remaining, request.requested)
         allocated = quantize_volume(max(ZERO, allocated))
         remaining = quantize_volume(remaining - allocated)
+        unfilled = quantize_volume(request.requested - allocated)
+        if unfilled <= ZERO:
+            outcome, reason = "allocated", "capacity_granted"
+        elif allocated > ZERO:
+            outcome, reason = "partial", "capacity_exhausted"
+        else:
+            outcome, reason = "rejected", "capacity_exhausted"
         result.append({
             "nomination_id": request.nomination_id,
             "requested_control_slots": decimal_text(request.requested),
             "allocated_control_slots": decimal_text(allocated),
-            "unfilled_control_slots": decimal_text(quantize_volume(request.requested - allocated)),
+            "unfilled_control_slots": decimal_text(unfilled),
+            "outcome": outcome,
+            "reason": reason,
         })
     return result
 
