@@ -127,12 +127,24 @@ CREATE TABLE IF NOT EXISTS allocation_runs (
     allocation_id INTEGER PRIMARY KEY AUTOINCREMENT,
     route_id TEXT NOT NULL REFERENCES routes(route_id),
     service_date TEXT NOT NULL,
+    bus_revision INTEGER NOT NULL,
+    degraded INTEGER NOT NULL CHECK(degraded IN (0,1)),
+    degradation_sha256 TEXT NOT NULL,
+    request_set_sha256 TEXT NOT NULL,
     input_sha256 TEXT NOT NULL,
     available_capacity TEXT NOT NULL,
     result_json TEXT NOT NULL,
     created_by TEXT NOT NULL REFERENCES supply_users(user_id),
     created_at TEXT NOT NULL,
-    UNIQUE(route_id, service_date, input_sha256)
+    UNIQUE(route_id, service_date)
+);
+
+CREATE TABLE IF NOT EXISTS freeze_outage_snapshots (
+    allocation_id INTEGER NOT NULL REFERENCES allocation_runs(allocation_id),
+    outage_id INTEGER NOT NULL,
+    capacity_percent TEXT NOT NULL,
+    outage_revision INTEGER NOT NULL,
+    PRIMARY KEY(allocation_id, outage_id)
 );
 
 CREATE TABLE IF NOT EXISTS transfers (
@@ -198,17 +210,59 @@ ON supply_audit_events(entity_type, entity_id, event_id);
 
 
 def connect(path: str | Path) -> sqlite3.Connection:
-    connection = sqlite3.connect(str(path), isolation_level=None, timeout=10)
+    # HTTP 服务以 ThreadingHTTPServer 共享同一连接，裁决用进程锁串行化，
+    # 因此允许跨线程使用，并把等待写锁的时间放宽到 10 秒。
+    connection = sqlite3.connect(str(path), isolation_level=None, timeout=10, check_same_thread=False)
     connection.row_factory = sqlite3.Row
     connection.execute("PRAGMA foreign_keys=ON")
     connection.execute("PRAGMA journal_mode=WAL")
-    connection.execute("PRAGMA busy_timeout=5000")
+    connection.execute("PRAGMA busy_timeout=10000")
     initialize(connection)
     return connection
 
 
+def _table_columns(connection: sqlite3.Connection, table: str) -> set[str]:
+    return {row["name"] for row in connection.execute(f"PRAGMA table_info({table})").fetchall()}
+
+
+def _migrate(connection: sqlite3.Connection) -> None:
+    """把 003 版 allocation_runs（含按输入摘要的旧唯一约束）迁移到周期裁决表。"""
+    columns = _table_columns(connection, "allocation_runs")
+    if not columns or {"bus_revision", "degraded", "request_set_sha256"} <= columns:
+        return
+    connection.executescript(
+        """
+        ALTER TABLE allocation_runs RENAME TO allocation_runs_legacy;
+        CREATE TABLE allocation_runs (
+            allocation_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            route_id TEXT NOT NULL,
+            service_date TEXT NOT NULL,
+            bus_revision INTEGER NOT NULL,
+            degraded INTEGER NOT NULL CHECK(degraded IN (0,1)),
+            degradation_sha256 TEXT NOT NULL,
+            request_set_sha256 TEXT NOT NULL,
+            input_sha256 TEXT NOT NULL,
+            available_capacity TEXT NOT NULL,
+            result_json TEXT NOT NULL,
+            created_by TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            UNIQUE(route_id, service_date)
+        );
+        INSERT INTO allocation_runs(allocation_id,route_id,service_date,bus_revision,degraded,
+            degradation_sha256,request_set_sha256,input_sha256,available_capacity,result_json,
+            created_by,created_at)
+        SELECT allocation_id,route_id,service_date,1 AS bus_revision,0 AS degraded,
+               '0' AS degradation_sha256,input_sha256 AS request_set_sha256,input_sha256,
+               available_capacity,result_json,created_by,created_at
+        FROM allocation_runs_legacy;
+        DROP TABLE allocation_runs_legacy;
+        """
+    )
+
+
 def initialize(connection: sqlite3.Connection) -> None:
     connection.executescript(SCHEMA)
+    _migrate(connection)
 
 
 @contextmanager

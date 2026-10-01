@@ -5,12 +5,13 @@ from __future__ import annotations
 import hashlib
 import json
 import sqlite3
+import threading
 from datetime import timedelta
 from decimal import Decimal
 from typing import Any, Iterable, Mapping
 
 from .clock import SystemClock, parse_utc, utc_text
-from .errors import Conflict, Forbidden, InvalidState, NotFound, ValidationFailed
+from .errors import Conflict, Forbidden, InvalidState, NotFound, ScheduleConflict, ValidationFailed
 from .models import IndexQuote, Facility, InventoryLot, NominationRequest, Route, SupplyScenario
 from .planning import (
     AllocationRequest,
@@ -42,6 +43,9 @@ class SupplyService:
     def __init__(self, connection: sqlite3.Connection, clock=None) -> None:
         self.connection = connection
         self.clock = clock or SystemClock()
+        # 同一进程内（HTTP 线程共享连接）串行化控制周期裁决；
+        # BEGIN IMMEDIATE 再保证跨进程/跨连接只有一个裁决落库。
+        self._allocate_lock = threading.Lock()
         initialize(connection)
 
     def _now(self) -> str:
@@ -345,64 +349,239 @@ class SupplyService:
             raise Conflict("提名编号或幂等键冲突") from exc
         return response
 
-    def _capacity_for_date(self, route: sqlite3.Row, service_date: str) -> Decimal:
-        start = service_date + "T00:00:00Z"
-        end = service_date + "T23:59:59Z"
-        rows = self.connection.execute(
-            "SELECT capacity_percent FROM route_outages WHERE route_id=? AND state IN ('announced','active') "
-            "AND starts_at<=? AND (ends_at IS NULL OR ends_at>=?) ORDER BY outage_id",
-            (route["route_id"], end, start),
-        ).fetchall()
-        percentages = [Decimal(row["capacity_percent"]) for row in rows]
-        return effective_capacity(Decimal(route["daily_capacity"]), percentages)
+    @staticmethod
+    def _outage_windows(
+        rows: Iterable[sqlite3.Row],
+    ) -> list[dict[str, object]]:
+        windows: list[dict[str, object]] = []
+        for row in rows:
+            windows.append({
+                "outage_id": int(row["outage_id"]),
+                "revision": int(row["revision"]),
+                "starts_at": row["starts_at"],
+                "ends_at": row["ends_at"],
+                "capacity_percent": row["capacity_percent"],
+                "state": row["state"],
+            })
+        return windows
+
+    def _capacity_from_windows(self, nominal_text: str, windows: Iterable[Mapping[str, Any]]) -> Decimal:
+        percentages = [Decimal(str(item["capacity_percent"])) for item in windows]
+        return effective_capacity(Decimal(nominal_text), percentages)
 
     def allocate(self, actor_id: str, route_id: str, service_date: str) -> dict[str, Any]:
+        """对一个控制周期作出唯一、原子、可幂等重放的调度裁决。
+
+        整个“读取申请集合/总线版本/降级窗口 → 计算 → 冻结裁决”在单个
+        IMMEDIATE 事务内完成；进程内锁串行化共享连接上的并发线程，
+        IMMEDIATE 写锁串行化跨进程请求，因此同一控制周期至多一个裁决落库，
+        不会留下单侧动作或半更新申请。内容相同的重试拿回首次裁决；依据已
+        变化的后来者得到携带冻结版本与当前版本的业务冲突，而非存储异常。
+        """
         self._require(actor_id, "allocation.run")
-        route = self.connection.execute("SELECT * FROM routes WHERE route_id=?", (route_id,)).fetchone()
-        if route is None:
-            raise NotFound("实时控制总线不存在")
-        nominations = self.connection.execute(
-            "SELECT * FROM nominations WHERE route_id=? AND service_date=? AND state='submitted' "
-            "ORDER BY priority,submitted_at,nomination_id",
-            (route_id, service_date),
-        ).fetchall()
-        if not nominations:
-            raise InvalidState("没有待分配提名")
-        requests = [
-            AllocationRequest(
-                row["nomination_id"],
-                Decimal(row["requested_control_slots"]),
-                int(row["priority"]),
-                row["submitted_at"],
-            )
-            for row in nominations
-        ]
-        available = self._capacity_for_date(route, service_date)
-        input_value = [dict(row) for row in nominations]
-        input_sha256 = digest({"route": dict(route), "nominations": input_value, "capacity": str(available)})
-        result_rows = allocate_capacity(available, requests)
-        result = {
-            "route_id": route_id,
-            "service_date": service_date,
-            "available_capacity": decimal_text(available),
-            "allocations": result_rows,
-        }
+        with self._allocate_lock:
+            return self._freeze_allocation(actor_id, route_id, service_date)
+
+    def _freeze_allocation(self, actor_id: str, route_id: str, service_date: str) -> dict[str, Any]:
         with transaction(self.connection, immediate=True):
-            cursor = self.connection.execute(
-                "INSERT INTO allocation_runs(route_id,service_date,input_sha256,available_capacity,result_json,"
-                "created_by,created_at) VALUES(?,?,?,?,?,?,?)",
-                (route_id, service_date, input_sha256, decimal_text(available), canonical_json(result), actor_id, self._now()),
+            route = self.connection.execute(
+                "SELECT * FROM routes WHERE route_id=?", (route_id,)
+            ).fetchone()
+            if route is None:
+                raise NotFound("实时控制总线不存在")
+
+            frozen = self.connection.execute(
+                "SELECT * FROM allocation_runs WHERE route_id=? AND service_date=?",
+                (route_id, service_date),
+            ).fetchone()
+            pending = self.connection.execute(
+                "SELECT * FROM nominations WHERE route_id=? AND service_date=? AND state='submitted' "
+                "ORDER BY priority,submitted_at,nomination_id",
+                (route_id, service_date),
+            ).fetchall()
+            windows = self._outage_windows(self._outage_rows(route, service_date))
+            degraded = bool(windows)
+            degradation_digest = digest(windows)
+            current_revision = int(route["revision"])
+
+            if frozen is not None:
+                # 首次裁决已把当时的申请全部转为 allocated/cancelled；因此此刻仍处于
+                # submitted 的提名必然是裁决冻结之后新到的申请。
+                new_requests = [dict(row) for row in pending]
+                basis_changed = (
+                    current_revision != int(frozen["bus_revision"])
+                    or degradation_digest != frozen["degradation_sha256"]
+                    or bool(new_requests)
+                )
+                if not basis_changed:
+                    # 内容相同的重试：原样拿回首次裁决，执行侧不会收到第二份决定。
+                    return {
+                        "allocation_id": int(frozen["allocation_id"]),
+                        **json.loads(frozen["result_json"]),
+                        "replayed": True,
+                    }
+                current_capacity = self._capacity_from_windows(route["daily_capacity"], windows)
+                raise ScheduleConflict(
+                    "该控制周期已有冻结裁决，当前申请依据与裁决冻结时的版本不一致",
+                    details={
+                        "control_cycle": {"route_id": route_id, "service_date": service_date},
+                        "reason": self._conflict_reason(frozen, current_revision, degradation_digest, new_requests),
+                        "frozen_decision": {
+                            "allocation_id": int(frozen["allocation_id"]),
+                            "bus_revision": int(frozen["bus_revision"]),
+                            "degraded": bool(frozen["degraded"]),
+                            "degradation_sha256": frozen["degradation_sha256"],
+                            "request_set_sha256": frozen["request_set_sha256"],
+                            "available_capacity": frozen["available_capacity"],
+                        },
+                        "current_basis": {
+                            "bus_revision": current_revision,
+                            "degraded": degraded,
+                            "degradation_sha256": degradation_digest,
+                            "degradation_windows": windows,
+                            "available_capacity": decimal_text(current_capacity),
+                            "new_request_ids": [item["nomination_id"] for item in new_requests],
+                            "request_set_sha256": digest(new_requests),
+                        },
+                    },
+                )
+
+            if not pending:
+                raise InvalidState("没有待分配提名")
+
+            requests = [
+                AllocationRequest(
+                    row["nomination_id"],
+                    Decimal(row["requested_control_slots"]),
+                    int(row["priority"]),
+                    row["submitted_at"],
+                )
+                for row in pending
+            ]
+            available = self._capacity_from_windows(route["daily_capacity"], windows)
+            input_value = [dict(row) for row in pending]
+            request_digest = digest(input_value)
+            input_sha256 = digest(
+                {
+                    "route": dict(route),
+                    "nominations": input_value,
+                    "capacity": str(available),
+                    "degradation_windows": windows,
+                }
             )
+            result_rows = allocate_capacity(available, requests)
+            result = {
+                "route_id": route_id,
+                "service_date": service_date,
+                "bus_revision": current_revision,
+                "degraded": degraded,
+                "degradation_windows": windows,
+                "available_capacity": decimal_text(available),
+                "allocations": result_rows,
+            }
+            created_at = self._now()
+            try:
+                cursor = self.connection.execute(
+                    "INSERT INTO allocation_runs(route_id,service_date,bus_revision,degraded,"
+                    "degradation_sha256,request_set_sha256,input_sha256,available_capacity,"
+                    "result_json,created_by,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                    (
+                        route_id,
+                        service_date,
+                        current_revision,
+                        1 if degraded else 0,
+                        degradation_digest,
+                        request_digest,
+                        input_sha256,
+                        decimal_text(available),
+                        canonical_json(result),
+                        actor_id,
+                        created_at,
+                    ),
+                )
+            except sqlite3.IntegrityError as exc:
+                # 防御性兜底：即使锁外已有裁决落库，也绝不向接口泄露存储异常。
+                raise ScheduleConflict(
+                    "该控制周期的调度裁决已被其他调度方冻结",
+                    details={
+                        "control_cycle": {"route_id": route_id, "service_date": service_date},
+                        "current_bus_revision": current_revision,
+                    },
+                ) from exc
+            allocation_id = int(cursor.lastrowid)
+            for window in windows:
+                self.connection.execute(
+                    "INSERT INTO freeze_outage_snapshots(allocation_id,outage_id,capacity_percent,outage_revision) "
+                    "VALUES(?,?,?,?)",
+                    (
+                        allocation_id,
+                        window["outage_id"],
+                        str(window["capacity_percent"]),
+                        window["revision"],
+                    ),
+                )
             for item in result_rows:
                 state = "allocated" if Decimal(item["allocated_control_slots"]) > 0 else "cancelled"
-                self.connection.execute(
+                updated = self.connection.execute(
                     "UPDATE nominations SET allocated_control_slots=?,state=?,revision=revision+1 "
                     "WHERE nomination_id=? AND state='submitted'",
                     (item["allocated_control_slots"], state, item["nomination_id"]),
                 )
-            allocation_id = int(cursor.lastrowid)
-            self._audit("route", route_id, "allocation.completed", actor_id, {"allocation_id": allocation_id})
-        return {"allocation_id": allocation_id, **result}
+                if updated.rowcount != 1:
+                    # 申请在裁决窗口内被并发改动：整体回滚，不允许单侧动作。
+                    raise ScheduleConflict(
+                        "申请集合在裁决冻结期间发生变化",
+                        details={
+                            "control_cycle": {"route_id": route_id, "service_date": service_date},
+                            "nomination_id": item["nomination_id"],
+                        },
+                    )
+            self._audit(
+                "route",
+                route_id,
+                "allocation.frozen",
+                actor_id,
+                {
+                    "allocation_id": allocation_id,
+                    "service_date": service_date,
+                    "control_cycle": route_id + ":" + service_date,
+                    "bus_revision": current_revision,
+                    "degraded": degraded,
+                    "degradation_sha256": degradation_digest,
+                    "request_set_sha256": request_digest,
+                    "input_sha256": input_sha256,
+                    "degradation_windows": windows,
+                },
+            )
+        return {"allocation_id": allocation_id, **result, "replayed": False}
+
+    @staticmethod
+    def _conflict_reason(
+        frozen: sqlite3.Row,
+        current_revision: int,
+        degradation_digest: str,
+        new_requests: list[dict[str, object]],
+    ) -> list[str]:
+        reasons: list[str] = []
+        if current_revision != int(frozen["bus_revision"]):
+            reasons.append("bus_revision_changed")
+        if degradation_digest != frozen["degradation_sha256"]:
+            reasons.append("degradation_window_changed")
+        if new_requests:
+            reasons.append("new_requests_after_freeze")
+        return reasons
+
+    def _outage_rows(self, route: sqlite3.Row, service_date: str) -> list[sqlite3.Row]:
+        start = service_date + "T00:00:00Z"
+        end = service_date + "T23:59:59Z"
+        return list(
+            self.connection.execute(
+                "SELECT outage_id,revision,starts_at,ends_at,capacity_percent,state FROM route_outages "
+                "WHERE route_id=? AND state IN ('announced','active') "
+                "AND starts_at<=? AND (ends_at IS NULL OR ends_at>=?) ORDER BY outage_id",
+                (route["route_id"], end, start),
+            ).fetchall()
+        )
 
     def dispatch_transfer(
         self,

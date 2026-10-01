@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import sqlite3
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -87,9 +88,18 @@ class JsonApplication:
                 return Response(200, self.service.audit_chain(actor))
             return Response(404, {"error": {"code": "route_not_found", "message": "接口不存在"}})
         except SupplyError as exc:
-            return Response(exc.status, {"error": {"code": exc.code, "message": str(exc)}})
+            error: dict[str, Any] = {"code": exc.code, "message": str(exc)}
+            if exc.details is not None:
+                error["details"] = exc.details
+            return Response(exc.status, {"error": error})
         except (KeyError, TypeError, ValueError) as exc:
             return Response(422, {"error": {"code": "invalid_request", "message": str(exc)}})
+        except sqlite3.Error:
+            # 存储层异常一律不外泄：对外只给出中性的暂不可用，细节留在服务端。
+            return Response(
+                503,
+                {"error": {"code": "temporarily_unavailable", "message": "调度裁决暂不可用，请稍后依据当前周期版本重试"}},
+            )
 
 
 def make_handler(application: JsonApplication):

@@ -38,6 +38,23 @@ PYTHONPATH=src python3 -m component_qualification.acceptance
 
 三条命令会在临时 SQLite 数据库中完成控制资源分配、AI 验证分析和国产电子部件质量流程，不访问外部网络。
 
+## 实时总线并发裁决
+
+左右机械臂控制器在同一调度周期争抢实时总线时，平台以控制周期（总线 + 服务日）为单位作出**唯一、原子、可幂等重放**的业务裁决：
+
+- “读取申请集合 / 总线版本 / 降级窗口 → 计算 → 冻结”在单个 `BEGIN IMMEDIATE` 事务内完成，并由服务内进程锁串行化，同一周期至多一份决定落库；提交失败整体回滚，不会留下单侧动作或半更新申请。
+- 裁决冻结的内容包含：本次采用的申请集合摘要（`request_set_sha256`）、降级窗口（`degraded` / `degradation_windows` 及其摘要，快照入 `freeze_outage_snapshots`）和总线版本（`bus_revision`）。
+- 内容相同的重试原样返回首次裁决（`replayed=true`），执行侧不会收到第二份决定；依据已变化（总线版本变更、降级窗口变更或冻结后又有新申请）的后来者收到 `409 schedule_conflict`，响应同时给出冻结版本与当前版本及落选原因，绝不泄露 SQLite 存储异常。
+
+联调复现（多个独立连接在同一屏障后并发发起同一周期申请）：
+
+```bash
+PYTHONPATH=src python3 -m robot_control.arbitration_demo --racers 8
+```
+
+输出稳定给出赢家时隙、落选原因（未满足量）、实际占用的控制周期，并可从 `execution_side_audit` 确认 `allocation_runs` 与 `allocation.frozen` 审计事件都只有一份。
+
+
 ## HTTP 服务
 
 ```bash
